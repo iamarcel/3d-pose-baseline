@@ -115,6 +115,24 @@ def load_data( bpath, subjects, actions, dim=3 ):
   return data
 
 
+def process_stacked_hourglass(predictions):
+  """Processes a set of Stacked Hourglass predictions so they have the same
+  shape as required in the model.
+  """
+
+  if predictions.shape[1] != len(SH_NAMES) * 2:
+    raise ValueError("Expected predictions to be in Stacked Hourglass format, i.e. of shape (?, " + str(len(SH_NAMES)*2) + "), but got " + str(predictions.shape))
+
+  destination_indices = np.array([np.where(np.array(H36M_NAMES) == name)[0] for name in SH_NAMES]).flatten()
+
+  # Store in flattened 2D coordinate array
+  poses = np.zeros((predictions.shape[0], len(H36M_NAMES) * 2))
+  poses[:, destination_indices * 2] = predictions[:, 0::2]
+  poses[:, destination_indices * 2 + 1] = predictions[:, 1::2]
+
+  return poses, np.sort(destination_indices)
+
+
 def load_stacked_hourglass(data_dir, subjects, actions):
   """
   Load 2d detections from disk, and put it in an easy-to-acess dictionary.
@@ -138,10 +156,10 @@ def load_stacked_hourglass(data_dir, subjects, actions):
   for subj in subjects:
     for action in actions:
 
-      print('Reading subject {0}, action {1}'.format(subj, action))
+      # print('Reading subject {0}, action {1}'.format(subj, action))
 
       dpath = os.path.join( data_dir, 'S{0}'.format(subj), 'StackedHourglass/{0}*.h5'.format(action) )
-      print( dpath )
+      # print( dpath )
 
       fnames = glob.glob( dpath )
 
@@ -157,7 +175,7 @@ def load_stacked_hourglass(data_dir, subjects, actions):
         # This rule makes sure that WalkDog and WalkTogeter are not loaded when
         # Walking is requested.
         if seqname.startswith( action ):
-          print( fname )
+          # print( fname )
           loaded_seqs = loaded_seqs + 1
 
           # Load the poses from the .h5 file
@@ -490,3 +508,25 @@ def postprocess_3d( poses_set ):
     poses_set[k] = poses
 
   return poses_set, root_positions
+
+def tony():
+  sh_data = np.array([371,469,511,933,525,638,638,652,638,947,638,1017,582,652,596,342,582,286,539,160,371,469,427,483,497,328,694,342,722,539,568,497])
+
+  SH_TO_GT_PERM = np.array([SH_NAMES.index( h ) for h in H36M_NAMES if h != '' and h in SH_NAMES])
+  assert np.all( SH_TO_GT_PERM == np.array([6,2,1,0,3,4,5,7,8,9,13,14,15,12,11,10]) )
+
+  # Permute the loaded data to make it compatible with H36M
+  poses = np.reshape(sh_data, (len(SH_NAMES),2))[SH_TO_GT_PERM,:]
+
+  # Reshape into n x (32*2) matrix
+  pose_final = np.zeros(len(H36M_NAMES)*2)
+
+  dim_to_use_x    = np.where(np.array([x != '' and x != 'Neck/Nose' for x in H36M_NAMES]))[0] * 2
+  dim_to_use_y    = dim_to_use_x+1
+
+  dim_to_use = np.zeros(len(SH_NAMES)*2,dtype=np.int32)
+  dim_to_use[0::2] = dim_to_use_x
+  dim_to_use[1::2] = dim_to_use_y
+  pose_final[dim_to_use] = poses
+
+  return pose_final

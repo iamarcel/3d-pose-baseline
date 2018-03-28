@@ -12,12 +12,17 @@ import sys
 import time
 import h5py
 import copy
+import csv
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 import procrustes
+import json
+from PIL import Image
 
 import viz
 import cameras
@@ -36,6 +41,7 @@ tf.app.flags.DEFINE_boolean("batch_norm", False, "Use batch_normalization")
 tf.app.flags.DEFINE_boolean("predict_14", False, "predict 14 joints")
 tf.app.flags.DEFINE_boolean("use_sh", False, "Use 2d pose predictions from StackedHourglass")
 tf.app.flags.DEFINE_string("action","All", "The action to train on. 'All' means all the actions")
+tf.app.flags.DEFINE_string("config_file", "config.json", "The JSON file with the data")
 
 # Architecture
 tf.app.flags.DEFINE_integer("linear_size", 1024, "Size of each model layer.")
@@ -128,6 +134,39 @@ def create_model( session, actions, batch_size ):
         raise ValueError("Asked to load checkpoint {0}, but it does not seem to exist".format(FLAGS.load))
     else:
       ckpt_name = os.path.basename( ckpt.model_checkpoint_path )
+
+    print("Loading model {0}".format( ckpt_name ))
+    model.saver.restore( session, ckpt.model_checkpoint_path )
+    return model
+  else:
+    print("Could not find checkpoint. Aborting.")
+    raise( ValueError, "Checkpoint {0} does not seem to exist".format( ckpt.model_checkpoint_path ) )
+
+  return model
+
+def load_model(session, batch_size):
+  model = linear_model.LinearModel(
+      FLAGS.linear_size,
+      FLAGS.num_layers,
+      FLAGS.residual,
+      FLAGS.batch_norm,
+      FLAGS.max_norm,
+      batch_size,
+      FLAGS.learning_rate,
+      summaries_dir,
+      FLAGS.predict_14,
+      dtype=tf.float16 if FLAGS.use_fp16 else tf.float32)
+
+  # Load a previously saved model
+  ckpt = tf.train.get_checkpoint_state( train_dir, latest_filename="checkpoint")
+  print( "train_dir", train_dir )
+
+  if ckpt and ckpt.model_checkpoint_path:
+    # Check if the specific checkpoint exists
+    if os.path.isfile(os.path.join(train_dir,"checkpoint-{0}.index".format(FLAGS.load))):
+      ckpt_name = os.path.join( os.path.join(train_dir,"checkpoint-{0}".format(FLAGS.load)) )
+    else:
+      raise ValueError("Asked to load checkpoint {0}, but it does not seem to exist".format(FLAGS.load))
 
     print("Loading model {0}".format( ckpt_name ))
     model.saver.restore( session, ckpt.model_checkpoint_path )
@@ -527,11 +566,172 @@ def sample():
 
   plt.show()
 
+def predict_batch(data, center, scale, batch_size=128):
+  """
+  Input:
+    data: matrix with shape (#frames, 32)
+    center: length-2 array with center coordinate
+    scale: stacked hourglass scale parameter
+  """
+
+  fig = plt.figure()
+  ax_2d = fig.add_subplot(121)
+  ax_3d = fig.add_subplot(122, projection='3d')
+
+  data = np.array(data)
+
+  # Wrap in another matrix if there's only a single clip
+  if len(data.shape) == 1:
+    data = np.array([data])
+
+  if data.shape[1] != 32:
+    raise ValueError("Expected data shape to be (?, 32), got " + str(data.shape))
+
+  data, destination_indices = data_utils.process_stacked_hourglass(data)
+  normalized_data, data_mean_3d, data_std_3d, dim_to_ignore_3d = normalize_batch(data)
+  viz.show2Dpose(np.reshape(data[30], (64, 1)), ax_2d)
+  ax_2d.invert_yaxis()
+
+  with tf.Session() as sess:
+    model = load_model(sess, batch_size)
+    dp = 1.0
+    dec_out = np.zeros((normalized_data.shape[0], 48))
+    _, _, points = model.step(sess, normalized_data, dec_out, dp, isTraining=False)
+
+    points = data_utils.unNormalizeData(points, data_mean_3d, data_std_3d, dim_to_ignore_3d)
+    viz.show3Dpose(points[30,:], ax_3d)
+    plt.show()
+    points = np.reshape(points, (-1, 32, 3))
+
+    return points
+
+
+def normalize_batch(frames):
+  actions = data_utils.define_actions(FLAGS.action)
+  SUBJECT_IDS = [1, 5, 6, 7, 8, 9, 11]
+
+  # Get training data stats
+  rcams = cameras.load_cameras(FLAGS.cameras_path, SUBJECT_IDS)
+  train_set_2d, test_set_2d, data_mean_2d, data_std_2d, dim_to_ignore_2d, dim_to_use_2d = data_utils.read_2d_predictions(
+    actions, FLAGS.data_dir)
+  train_set_3d, test_set_3d, data_mean_3d, data_std_3d, dim_to_ignore_3d, dim_to_use_3d, train_root_positions, test_root_positions = data_utils.read_3d_data(
+    actions, FLAGS.data_dir, FLAGS.camera_frame, rcams, FLAGS.predict_14)
+
+  mu = np.mean(frames, axis=0)[dim_to_use_2d]
+  stddev = np.std(frames, axis=0)[dim_to_use_2d]
+
+  # Normalize input
+  enc_in = np.divide(frames[:, dim_to_use_2d] - np.tile(mu, (frames.shape[0], 1)), np.tile(stddev, (frames.shape[0], 1)))
+
+  return enc_in, data_mean_3d, data_std_3d, dim_to_ignore_3d
+
+
+def plot_skeleton(points, image_paths):
+  if (points.shape[1] != 32 or points.shape[2] != 3):
+    raise ValueError("Expected points.shape to be (?, 32, 3), got " + str(points.shape))
+
+  fig = plt.figure()
+  ax = fig.add_subplot(121, projection='3d')
+  ax_img = fig.add_subplot(122, projection='3d')
+
+  I   = np.array([1,2,3,1,7,8,1, 13,14,15,14,18,19,14,26,27])-1 # start points
+  J   = np.array([2,3,4,7,8,9,13,14,15,16,18,19,20,26,27,28])-1 # end points
+  LR  = np.array([1,1,1,0,0,0,0, 0, 0, 0, 0, 0, 0, 1, 1, 1], dtype=bool)
+  lcolor="#3498db"
+  rcolor="#e74c3c"
+
+  lines = []
+  # draw first line
+  for i in np.arange( len(I) ):
+    x, y, z = [np.array( [points[0][I[i], j], points[0][J[i], j]] ) for j in range(3)]
+    lines.append(ax.plot(x, z, -y, lw=2, c=lcolor if LR[i] else rcolor)[0])
+
+  img = plt.imshow(Image.open(image_paths[0]))
+  img_i = 0
+
+  def update(frame):
+    img.set_data(Image.open(image_paths[img_i]))
+    img_i += 1
+
+    # Make connection matrix
+    for i in np.arange( len(I) ):
+      x, y, z = [np.array( [frame[I[i], j], frame[J[i], j]] ) for j in range(3)]
+      # ax.plot(x, y, z, lw=2, c=lcolor if LR[i] else rcolor)
+      lines[i].set_data(x, z)
+      lines[i].set_3d_properties(-y)
+
+  ani = FuncAnimation(fig, update, frames=points)
+
+  plt.show()
+
+
+def has_array(obj, key):
+  return (key in obj) and len(obj[key]) > 0
+
+def invert_every(interval):
+  def invertor(obj):
+    return [-x if i % interval == 0 else x for (i, x) in enumerate(obj)]
+  return invertor
+
 def main(_):
-  if FLAGS.sample:
-    sample()
-  else:
-    train()
+  # if FLAGS.sample:
+  #   sample()
+  # else:
+  #   train()
+
+  config = {}
+  with open(FLAGS.config_file) as config_file:
+    config = json.load(config_file)
+
+  input_indices = []
+  input_points = np.empty((0, 32))
+  input_keys = []
+
+  for i, clip in enumerate(config['clips']):
+    if has_array(clip, 'points_2d') and not has_array(clip, 'points_3d'):
+      print("Queueing 3D poses for " + str(clip['id']))
+      input_keys.append((len(input_points), len(input_points) + len(clip['points_2d'])))
+      points_2d = np.array(clip['points_2d'])
+      input_points = np.append(input_points, points_2d, axis=0)
+      input_indices.append(i)
+
+  poses_3d = predict_batch(input_points, None, None)
+  for i, (start, end) in enumerate(input_keys):
+    config['clips'][input_indices[i]]['points_3d'] = poses_3d[start:end].tolist()
+
+  with open(FLAGS.config_file, 'w') as config_file:
+    json.dump(config, config_file, indent=2)
+    print("Wrote " + str(FLAGS.config_file))
+
+  # image_root = config['image_root']
+  # preview_keys = input_keys[0]
+  # preview_poses = poses_3d[preview_keys[0]:preview_keys[1]]
+  # preview_id = config['clips']
+  # preview_images = config['clips'][input_indices[0]]['']
+  # plot_skeleton(poses_3d)
+
+  # frames = np.loadtxt(FLAGS.poses_input, delimiter=',')
+  # poses3d = predict_batch(frames, None, None)
+  # poses3d_flat = np.reshape(poses3d, (-1, 16*3))
+  # np.savetxt(FLAGS.poses_output, poses3d_flat, delimiter=',')
+  # print("Saved results in " + str(FLAGS.poses_output))
+  # plot_skeleton(poses3d)
+
+def image_path(id, i, root, ext):
+  return os.path.join(root, id + "-" + str(i) + ext)
+
+def preview_first_clip():
+  config = {}
+  with open(FLAGS.config_file) as config_file:
+    config = json.load(config_file)
+
+  image_root = config['image_root']
+  image_extension = config['image_extension']
+  clip = config['clips'][0]
+  images = [image_path(clip['id'], i, image_root, image_extension) for i in range(clip['end'] - clip['start'])]
+
+  plot_skeleton(preview_images)
+
 
 if __name__ == "__main__":
   tf.app.run()
